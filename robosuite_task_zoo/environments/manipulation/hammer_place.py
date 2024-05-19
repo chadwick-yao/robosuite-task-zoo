@@ -70,8 +70,9 @@ class HammerPlaceEnv(SingleArmEnv):
         # History observations
         self._history_force_torque = None
         self._recent_force_torque = None
-        
+
         self.objects = []
+        self.curr_max_rewards = 0.0
 
         super().__init__(
             robots=robots,
@@ -123,15 +124,38 @@ class HammerPlaceEnv(SingleArmEnv):
         Returns:
             float: reward value
         """
-        reward = 0.
+        reward = 0.0
 
-        # sparse completion reward
-        if self._check_success():
+        # check for open drawer and eef's height meets a threshold (stage 1)
+        drawer_open = self.sim.data.qpos[self.cabinet_qpos_addrs] <= -0.125
+        grip_overhead = self.sim.data.site_xpos[self.grip_site_id][2] >= 1.045
+        if drawer_open and grip_overhead:
             reward = 1.0
+
+        # check for grasping object (stage 2)
+        obj_grasped = self._check_grasp(
+            gripper=self.robots[0].gripper,
+            object_geoms=self.sorting_object,
+        )
+        if obj_grasped and drawer_open:
+            reward = 2.0
+
+        object_pos = self.sim.data.body_xpos[self.sorting_object_id]
+        object_in_drawer = 1.0 > object_pos[2] > 0.94 and object_pos[1] > 0.22
+
+        cabinet_closed = self.sim.data.qpos[self.cabinet_qpos_addrs] > -0.005
+
+        if object_in_drawer and cabinet_closed:
+            reward = 3.0
+
+        reward = reward / 3.0
 
         # Scale reward if requested
         if self.reward_scale is not None:
             reward *= self.reward_scale / 1.0
+
+        self.curr_max_rewards = max(self.curr_max_rewards, reward)
+        reward = self.curr_max_rewards
 
         return reward
 
@@ -167,8 +191,7 @@ class HammerPlaceEnv(SingleArmEnv):
             pos=[0.5586131746834771, 0.3, 1.2903500240372423],
             quat=[0.4144233167171478, 0.3100920617580414, 0.49641484022140503, 0.6968992352485657]
         )
-        
-        
+
         bread = CustomMaterial(
             texture="Bread",
             tex_name="bread",
@@ -210,7 +233,7 @@ class HammerPlaceEnv(SingleArmEnv):
             "specular": "0.4",
             "shininess": "0.1"
         }
-        
+
         greenwood = CustomMaterial(
             texture="WoodGreen",
             tex_name="greenwood",
@@ -225,7 +248,7 @@ class HammerPlaceEnv(SingleArmEnv):
             tex_attrib=tex_attrib,
             mat_attrib=mat_attrib,
         )
-        
+
         bluewood = CustomMaterial(
             texture="WoodBlue",
             tex_name="bluewood",
@@ -243,7 +266,7 @@ class HammerPlaceEnv(SingleArmEnv):
         )
 
         ingredient_size = [0.03, 0.018, 0.025]
-        
+
         self.sorting_object = HammerObject(name="hammer",
                                            handle_length=(0.045, 0.05),
                                            handle_radius=(0.012, 0.012),
@@ -253,7 +276,7 @@ class HammerPlaceEnv(SingleArmEnv):
         self.cabinet_object = CabinetObject(
             name="CabinetObject")
         cabinet_object = self.cabinet_object.get_obj(); cabinet_object.set("pos", array_to_string((0.2, 0.30, 0.03))); mujoco_arena.table_body.append(cabinet_object)
-        
+
         for obj_body in [
                 self.cabinet_object,
         ]:
@@ -265,7 +288,7 @@ class HammerPlaceEnv(SingleArmEnv):
                 obj_body.asset.append(mat_element)
 
         ingredient_size = [0.015, 0.025, 0.02]
-        
+
         self.placement_initializer = SequentialCompositeSampler(name="ObjectSampler")
 
         self.placement_initializer.append_sampler(
@@ -281,7 +304,7 @@ class HammerPlaceEnv(SingleArmEnv):
             reference_pos=self.table_offset,
             z_offset=0.02,
         ))
-        
+
         mujoco_objects = [
             self.sorting_object,
         ]
@@ -298,7 +321,6 @@ class HammerPlaceEnv(SingleArmEnv):
         ]
         self.model.merge_assets(self.sorting_object)
         self.model.merge_assets(self.cabinet_object)
-        
 
     def _setup_references(self):
         """
@@ -308,6 +330,7 @@ class HammerPlaceEnv(SingleArmEnv):
         """
         super()._setup_references()
 
+        self.grip_site_id = self.sim.model.site_name2id(self.robots[0].gripper.important_sites["grip_site"])
         # Additional object references from this env
         self.object_body_ids = dict()
 
@@ -315,11 +338,11 @@ class HammerPlaceEnv(SingleArmEnv):
 
         self.sorting_object_id = self.sim.model.body_name2id(self.sorting_object.root_body)
         self.cabinet_object_id = self.sim.model.body_name2id(self.cabinet_object.root_body)
-        
+
         self.obj_body_id = {}        
         for obj in self.objects:
             self.obj_body_id[obj.name] = self.sim.model.body_name2id(obj.root_body)
-        
+
     def _setup_observables(self):
         """
         Sets up observables to be used for this environment. Creates object-based observables if enabled
@@ -330,7 +353,7 @@ class HammerPlaceEnv(SingleArmEnv):
         observables = super()._setup_observables()
 
         observables["robot0_joint_pos"]._active = True
-        
+
         # low-level object information
         if self.use_object_obs:
             # Get robot prefix and define observables modality
@@ -363,7 +386,7 @@ class HammerPlaceEnv(SingleArmEnv):
 
             sensors += obj_sensors
             names += obj_sensor_names
-            
+
         @sensor(modality=modality)
         def gripper_contact(obs_cache):
             return self._has_gripper_contact
@@ -390,7 +413,7 @@ class HammerPlaceEnv(SingleArmEnv):
                     sensor=s,
                     sampling_rate=self.control_freq
                 )
-                
+
         return observables
 
     def _create_obj_sensors(self, obj_name, modality="object"):
@@ -438,14 +461,14 @@ class HammerPlaceEnv(SingleArmEnv):
         names = [f"{obj_name}_pos", f"{obj_name}_quat", f"{obj_name}_to_{pf}eef_pos", f"{obj_name}_to_{pf}eef_quat"]
 
         return sensors, names
-    
-    
+
     def _reset_internal(self):
         """
         Resets simulation internal configurations.
         """
         super()._reset_internal()
 
+        self.curr_max_rewards = 0.0
         # Reset all object positions using initializer sampler if we're not directly loading from an xml
         if not self.deterministic_reset:
 
@@ -490,21 +513,20 @@ class HammerPlaceEnv(SingleArmEnv):
         if self.action_dim == 4:
             action = np.array(action)
             action = np.concatenate((action[:3], action[-1:]), axis=-1)
-        
+
         self._recent_force_torque = []
         obs, reward, done, info = super().step(action)
         info["history_ft"] = np.clip(np.copy(self._history_force_torque.buf), a_min=None, a_max=2)
         info["recent_ft"] = np.array(self._recent_force_torque)
         done = self._check_success()
         return obs, reward, done, info
-        
-        
+
     def _pre_action(self, action, policy_step=False):
         super()._pre_action(action, policy_step=policy_step)
 
         self._history_force_torque.push(np.hstack((self.robots[0].ee_force - self.ee_force_bias, self.robots[0].ee_torque - self.ee_torque_bias)))
         self._recent_force_torque.append(np.hstack((self.robots[0].ee_force - self.ee_force_bias, self.robots[0].ee_torque - self.ee_torque_bias)))
-        
+
     def _post_action(self, action):
         reward, done, info = super()._post_action(action)
 
@@ -512,9 +534,9 @@ class HammerPlaceEnv(SingleArmEnv):
         if np.linalg.norm(self.ee_force_bias) == 0:
             self.ee_force_bias = self.robots[0].ee_force
             self.ee_torque_bias = self.robots[0].ee_torque
-            
+
         return reward, done, info
-        
+
     @property
     def _has_gripper_contact(self):
         """
